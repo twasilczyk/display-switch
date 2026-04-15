@@ -99,7 +99,7 @@ pub fn log_current_source() {
         let display_name = display_name(&display, if unique_names { None } else { Some(index + 1) });
         match display.handle.get_vcp_feature(INPUT_SELECT) {
             Ok(raw_source) => {
-                let source = InputSource::from(raw_source.value());
+                let source = InputSource::from(raw_source);
                 info!("Display {} is currently set to {}", display_name, source);
             }
             Err(err) => {
