@@ -8,9 +8,20 @@ use crate::input_source::InputSource;
 use anyhow::{Error, Result};
 use ddc_hi::{Ddc, Display, Handle};
 
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::{thread, time};
+
+#[cfg(target_os = "linux")]
+use std::ffi::OsStr;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::sync::{Mutex, OnceLock};
+#[cfg(target_os = "linux")]
+use udev::DeviceType::CharacterDevice;
 
 /// VCP feature code for input select
 const INPUT_SELECT: u8 = 0x60;
@@ -70,8 +81,75 @@ fn try_switch_display(handle: &mut Handle, display_name: &str, input: InputSourc
     }
 }
 
+#[cfg(target_os = "linux")]
+fn display_connector_name(display: &Display) -> Option<String> {
+    let Handle::I2cDevice(i2c) = &display.handle;
+    let file = i2c.inner_ref().inner_ref();
+    let devnum = file.metadata().ok()?.rdev();
+
+    let context = udev::Context::new().ok()?;
+    let mut device = context.device_from_devnum(CharacterDevice, devnum).ok()?;
+
+    loop {
+        if device.subsystem() == Some(OsStr::new("drm")) {
+            let name = device.sysname().to_str()?;
+            if name.starts_with("card") && name.contains('-') {
+                return Some(name.to_owned());
+            }
+        }
+
+        device = device.parent()?;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_laptop_connector_name(name: &str) -> bool {
+    name.contains("-eDP-") || name.contains("-LVDS-")
+}
+
+#[cfg(target_os = "linux")]
+fn filtered_displays() -> Vec<Display> {
+    static SKIPPED_DISPLAYS: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let mut skipped_displays = SKIPPED_DISPLAYS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut displays = Vec::new();
+    for display in Display::enumerate() {
+        let display_id = display.info.id.clone();
+        if let Some(was_skipped) = skipped_displays.get(&display_id).copied() {
+            if !was_skipped {
+                displays.push(display);
+            }
+            continue;
+        }
+
+        let connector = display_connector_name(&display);
+        let is_skipped = connector.as_deref().is_some_and(is_laptop_connector_name);
+        skipped_displays.insert(display_id, is_skipped);
+        if !is_skipped {
+            displays.push(display);
+            continue;
+        }
+
+        info!(
+            "Skipping built-in laptop display {} on connector '{}'",
+            display_name(&display, None),
+            connector.unwrap(),
+        );
+    }
+
+    displays
+}
+
+#[cfg(not(target_os = "linux"))]
+fn filtered_displays() -> Vec<Display> {
+    Display::enumerate()
+}
+
 fn displays() -> Vec<Display> {
-    let displays = Display::enumerate();
+    let displays = filtered_displays();
     if !displays.is_empty() {
         return displays;
     }
@@ -85,7 +163,7 @@ fn displays() -> Vec<Display> {
         delay_duration.as_secs()
     );
     thread::sleep(delay_duration);
-    Display::enumerate()
+    filtered_displays()
 }
 
 pub fn log_current_source() {
