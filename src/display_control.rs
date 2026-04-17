@@ -26,6 +26,8 @@ use udev::DeviceType::CharacterDevice;
 /// VCP feature code for input select
 const INPUT_SELECT: u8 = 0x60;
 const RETRY_DELAY_MS: u64 = 3000;
+const GET_CURRENT_INPUT_RETRY_ATTEMPTS: usize = 5;
+const GET_CURRENT_INPUT_RETRY_DELAY_MS: u64 = 100;
 
 fn display_name(display: &Display, index: Option<usize>) -> String {
     // Different OSes populate different fields of ddc-hi-rs info structure differently. Create
@@ -58,8 +60,31 @@ fn are_display_names_unique(displays: &[Display]) -> bool {
     displays.iter().all(|display| hash.insert(display_name(display, None)))
 }
 
+fn get_current_input(handle: &mut Handle, display_name: &str) -> Result<ddc_hi::VcpValue> {
+    let retry_delay = time::Duration::from_millis(GET_CURRENT_INPUT_RETRY_DELAY_MS);
+
+    for attempt in 1.. {
+        match handle.get_vcp_feature(INPUT_SELECT) {
+            Ok(raw_source) => return Ok(raw_source),
+            Err(err) => {
+                if attempt >= GET_CURRENT_INPUT_RETRY_ATTEMPTS {
+                    return Err(err);
+                }
+
+                debug!(
+                    "Failed to get current input for display {} on attempt {}/{}: {:?}",
+                    display_name, attempt, GET_CURRENT_INPUT_RETRY_ATTEMPTS, err
+                );
+                thread::sleep(retry_delay);
+            }
+        }
+    }
+
+    unreachable!()
+}
+
 fn try_switch_display(handle: &mut Handle, display_name: &str, input: InputSource) {
-    match handle.get_vcp_feature(INPUT_SELECT) {
+    match get_current_input(handle, display_name) {
         Ok(raw_source) => {
             if raw_source.value() & 0xff == input.value() {
                 info!("Display {} is already set to {}", display_name, input);
@@ -175,7 +200,7 @@ pub fn log_current_source() {
     let unique_names = are_display_names_unique(&displays);
     for (index, mut display) in displays.into_iter().enumerate() {
         let display_name = display_name(&display, if unique_names { None } else { Some(index + 1) });
-        match display.handle.get_vcp_feature(INPUT_SELECT) {
+        match get_current_input(&mut display.handle, &display_name) {
             Ok(raw_source) => {
                 let source = InputSource::from(raw_source);
                 info!("Display {} is currently set to {}", display_name, source);
